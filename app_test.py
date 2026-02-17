@@ -915,7 +915,7 @@ footer_html = """
             <a href="#">Privacy</a>
             <a href="#">Contact</a>
         </div>
-        <a href="#" class="footer-brand">Colorlib</a>
+        <a href="#" class="footer-brand">AI Mood Adaptive Story</a>
         <div>
             &copy; 2019. All Rights Reserved.
         </div>
