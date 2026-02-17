@@ -1,0 +1,927 @@
+import streamlit as st
+import numpy as np
+import pickle, json
+import time
+import requests
+from datetime import datetime
+import random
+import os
+import re
+import nltk
+import google.generativeai as genai
+from nltk.corpus import stopwords
+from nltk.stem import WordNetLemmatizer
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.models import load_model
+from streamlit_mic_recorder import mic_recorder
+import speech_recognition as sr
+from pydub import AudioSegment
+import io
+import streamlit.components.v1 as components
+
+
+# ==========================================================
+# 1) DEEP LEARNING MODEL LOADING
+# ==========================================================
+@st.cache_resource
+def load_keras_model():
+    return load_model("sentiment_model.h5")
+
+@st.cache_resource
+def load_tokenizer():
+    with open("tokenizer.pkl", "rb") as f:
+        return pickle.load(f)
+
+@st.cache_resource
+def load_label_encoder():
+    with open("label_encoder.pkl", "rb") as f:
+        return pickle.load(f)
+
+@st.cache_data
+def load_config():
+    with open("config.json", "r") as f:
+        return json.load(f)
+
+model = load_keras_model()
+tokenizer = load_tokenizer()
+le = load_label_encoder()
+cfg = load_config()
+MAXLEN = int(cfg.get("maxlen", 65))
+
+
+# ==========================================================
+# 2) NLTK DOWNLOADS
+# ==========================================================
+nltk.download("punkt")
+nltk.download("stopwords")
+nltk.download("wordnet")
+nltk.download("omw-1.4")
+
+
+# ==========================================================
+# 3) GEMINI CONFIG
+# ==========================================================
+try:
+    genai.configure(api_key="AIzaSyB_0CIJZwGavWu6WBb3UyUyNJEMPoIpVf4")
+except Exception:
+    st.error("Google API Key not found.", icon="🔑")
+
+
+# ==========================================================
+# 4) THEME + EMOJIS (FROM YOUR ML UI)
+# ==========================================================
+color_palette = {
+    "Happy": ["#FFD700", "#FF5722", "#D8E089", "#A84E6C"],
+    "Sad": ["#39546D", "#13143B", "#192D31", "#000000"],
+    "Neutral": ["#745F47", "#77B177", "#9566A3", "#4B4B4B"],
+}
+
+mood_emojis = {
+    "Happy": "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExNHEyZ3BsYnh5MWxnenp1a3l0amplcnlsdHNtZWl0emhndzB6ejhzaSZlcD12MV9naWZzX3NlYXJjaCZjdD1n/11sBLVxNs7v6WA/giphy.gif",
+    "Sad": "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExaXIyejVyNXVucHdhczR1OWVxYnM4NTJkZTV5OGttcDlrcDhleXQydyZlcD12MV9naWZzX3NlYXJjaCZjdD1n/fhLgA6nJec3Cw/giphy.gif",
+    "Neutral": "https://media.giphy.com/media/v1.Y2lkPTc5MGI3NjExb2VxeWpnNXNydTB2cTJ0cm5nYzhxczE4d3B6bTkzNTdkaTNicjdhOCZlcD12MV9naWZzX3NlYXJjaCZjdD1n/iyCUpd3MOYLf8COyPQ/giphy.gif",
+}
+
+
+# ==========================================================
+# 5) PAGE CONFIG + SESSION STATE
+# ==========================================================
+st.set_page_config(layout="wide", page_title="AI Mood Adaptive Story")
+
+if "username" not in st.session_state:
+    st.session_state.username = ""
+
+if "mood" not in st.session_state:
+    st.session_state.mood = "Neutral"
+
+if "story" not in st.session_state:
+    st.session_state.story = "Your story will appear here once you share your mood."
+
+if "mood_history" not in st.session_state:
+    st.session_state.mood_history = []
+
+if "location_data" not in st.session_state:
+    st.session_state.location_data = None
+
+if "weather_data" not in st.session_state:
+    st.session_state.weather_data = None
+
+if "input_mode" not in st.session_state:
+    st.session_state.input_mode = "Type"
+
+if "voice_text" not in st.session_state:
+    st.session_state.voice_text = ""
+
+if "typed_text" not in st.session_state:
+    st.session_state.typed_text = ""
+
+
+# ==========================================================
+# 6) LOAD CSS FILE
+# ==========================================================
+@st.cache_data
+def get_local_css(file_name):
+    try:
+        with open(file_name) as f:
+            return f.read()
+    except FileNotFoundError:
+        return ""
+
+st.markdown(f"<style>{get_local_css('style.css')}</style>", unsafe_allow_html=True)
+
+
+# ==========================================================
+# 7) APPLY MOOD THEME (FROM YOUR ML UI)
+# ==========================================================
+def apply_mood_theme(mood):
+    emoji_url = mood_emojis.get(mood, mood_emojis["Neutral"])
+    
+
+    if mood == "Sad":
+        text_color = "#FFFFFF"
+        story_box_bg = "rgba(0, 0, 0, 0.6)"
+        base_bg_color = "#202020"
+        background_opacity = 0.5
+    else:
+        text_color = "#1E1E1E"
+        story_box_bg = "rgba(255, 255, 255, 0.85)"
+        base_bg_color = "#F0F0F0"
+        background_opacity = 0.3
+
+    story_box_style = f"""
+        .story-container {{
+            background-color: {story_box_bg};
+            color: {text_color};
+            border: 1px solid {text_color}44;
+            border-radius: 10px;
+            padding: 20px;
+            margin-top: 20px;
+            box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+            font-size: 1.1em;
+            line-height: 1.6;
+            transition: background-color 0.5s ease, color 0.5s ease;
+        }}
+    """
+
+    background_image_css = f"""
+        /* Set base background color for the app and ensure position is relative for the pseudo-element */
+        [data-testid="stAppViewContainer"] {{
+            background-color: {base_bg_color}; 
+            position: relative;
+            z-index: 1; /* Ensures content is above the pseudo-element */
+        }}
+
+        /* Create the pseudo-element to hold the image with low opacity */
+        [data-testid="stAppViewContainer"]::before {{
+            content: "";
+            position: fixed; /* Fixed so it covers the whole viewport */
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-image: url('{emoji_url}');
+            background-size: cover; /* CHANGED: To display the image once, covering the screen */
+            background-repeat: no-repeat; /* CHANGED: To prevent tiling */
+            background-position: center; /* Center the image */
+            opacity: {background_opacity}; /* ADJUSTED: Controls the contrast/fade of the background image only */
+            z-index: -1; /* Puts the background image behind all content */
+            pointer-events: none; /* Allows clicks to go through to the main content */
+        }}
+    """
+
+    st.markdown(
+        f"""
+        <style>
+            {story_box_style}
+            {background_image_css}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        f"""
+        <style>
+            .st-emotion-cache-arp25b h1,.st-emotion-cache-arp25b h2,.st-emotion-cache-arp25b h3,.st-emotion-cache-1weic72{{
+            color: #C8A46A; /* Base color for light mode */
+            }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+apply_mood_theme(st.session_state.mood)
+
+
+# ==========================================================
+# 8) SIDEBAR (FROM YOUR ML UI)
+# ==========================================================
+with st.sidebar:
+    st.title("Profile")
+    st.header(f"🧑‍💻 {st.session_state.username or 'Guest'}")
+    st.markdown("---")
+    st.subheader("📝 Mood History")
+
+    if not st.session_state.mood_history:
+        st.info("Your mood entries will appear here.")
+    else:
+        for entry in reversed(st.session_state.mood_history[-20:]):
+            st.markdown(f"> {entry}")
+
+
+# ==========================================================
+# 9) LIVE DATA (LOCATION + WEATHER)
+# ==========================================================
+@st.cache_data(show_spinner="Fetching live data...")
+def get_live_data():
+    try:
+        loc_res = requests.get("http://ip-api.com/json/", timeout=5)
+        loc_res.raise_for_status()
+        loc_data = loc_res.json()
+
+        city = loc_data.get("city", "Unknown")
+        country = loc_data.get("country", "")
+
+        weather_api_key = "c87ed51b805675cdc2eababdb7cc294b"
+        weather_res = requests.get(
+            f"https://api.openweathermap.org/data/2.5/weather?q={city}&appid={weather_api_key}&units=metric",
+            timeout=5,
+        )
+        weather_res.raise_for_status()
+
+        return f"{city}, {country}", weather_res.json()
+
+    except Exception:
+        return "Location unavailable", None
+
+
+if st.session_state.location_data is None:
+    st.session_state.location_data, st.session_state.weather_data = get_live_data()
+
+
+
+if st.session_state.location_data is None:
+    st.session_state.location_data, st.session_state.weather_data = get_live_data()
+
+city_name = st.session_state.location_data or "Unknown"
+temp_text = "--"
+desc_text = "Weather unavailable"
+
+if st.session_state.weather_data and "main" in st.session_state.weather_data:
+    try:
+        temp_text = f"{round(st.session_state.weather_data['main']['temp'])}°C"
+        desc_text = st.session_state.weather_data["weather"][0]["description"].title()
+    except:
+        pass
+
+html_holo_card = f"""
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+
+<style>
+body {{
+  margin: 0;
+  padding: 0;
+  background: transparent;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+}}
+
+.holo-wrapper {{
+  width: 1050px;
+  max-width: 100%;
+  padding: 8px;
+  box-sizing: border-box;
+  font-family: Arial, sans-serif;
+}}
+
+.holo-toggle {{
+  width: 100%;
+  display: flex;
+  justify-content: center;
+  margin-bottom: 12px;
+}}
+
+.holo-btn {{
+  padding: 10px 18px;
+  border-radius: 12px;
+  border: 1px solid rgba(0,255,255,0.35);
+  background: rgba(0,0,0,0.75);
+  color: #00ffff;
+  font-weight: 700;
+  cursor: pointer;
+  transition: 0.25s ease;
+}}
+
+.holo-btn:hover {{
+  box-shadow: 0 0 16px rgba(0,255,255,0.35);
+  transform: scale(1.02);
+}}
+
+.holo-card {{
+  width: 100%;
+  height: 240px;
+  border-radius: 26px;
+  background: rgba(0,0,0,0.88);
+  border: 1px solid rgba(0,255,255,0.35);
+  box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+
+  position: relative;
+  overflow: hidden;
+  text-align: center;
+
+  transition: transform 0.25s ease, box-shadow 0.25s ease;
+}}
+
+.holo-card::before {{
+  content: "";
+  position: absolute;
+  top: -60%;
+  left: -60%;
+  width: 220%;
+  height: 220%;
+  background: linear-gradient(
+    0deg,
+    transparent,
+    transparent 30%,
+    rgba(0,255,255,0.28)
+  );
+  transform: rotate(-45deg);
+  opacity: 0;
+  transition: all 0.55s ease;
+}}
+
+.holo-card:hover {{
+  transform: scale(1.02);
+  box-shadow: 0 0 22px rgba(0,255,255,0.45);
+}}
+
+.holo-card:hover::before {{
+  opacity: 1;
+  transform: rotate(-45deg) translateY(110%);
+}}
+
+.holo-text {{
+  color: #00ffff;
+  text-shadow: 0 0 10px rgba(0,255,255,0.3);
+  z-index: 2;
+  position: relative;
+}}
+
+.holo-time {{
+  font-size: 46px;
+  font-weight: 900;
+  margin: 5px 0;
+}}
+
+.holo-date {{
+  font-size: 14px;
+  opacity: 0.85;
+  letter-spacing: 2px;
+  text-transform: uppercase;
+}}
+
+.holo-hr {{
+  width: 40%;
+  border: 0.5px solid rgba(0,255,255,0.25);
+  margin: 16px 0;
+  z-index: 2;
+}}
+
+.holo-city {{
+  font-size: 18px;
+  font-weight: 700;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}}
+
+.holo-temp {{
+  font-size: 50px;
+  font-weight: 900;
+}}
+
+.holo-desc {{
+  font-size: 14px;
+  opacity: 0.8;
+}}
+
+.holo-split {{
+  display: none;
+  gap: 18px;
+  justify-content: center;
+  align-items: stretch;
+  width: 100%;
+}}
+
+.holo-split.active {{
+  display: flex;
+}}
+
+.holo-mini {{
+  flex: 1;
+  min-width: 0;
+  height: 180px;
+  border-radius: 22px;
+
+  /* ✅ not transparent */
+  background: rgba(0,0,0,0.88);
+
+  border: 1px solid rgba(0,255,255,0.35);
+  box-shadow: 0 10px 30px rgba(0,0,0,0.45);
+
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  align-items: center;
+
+  text-align: center;
+  padding: 18px 16px;
+  box-sizing: border-box;
+
+  position: relative;
+  overflow: hidden;
+
+  transition: transform 0.25s ease, box-shadow 0.25s ease;
+}}
+
+.holo-mini::before {{
+  content: "";
+  position: absolute;
+  top: -60%;
+  left: -60%;
+  width: 220%;
+  height: 220%;
+  background: linear-gradient(
+    0deg,
+    transparent,
+    transparent 30%,
+    rgba(0,255,255,0.28)
+  );
+  transform: rotate(-45deg);
+  opacity: 0;
+  transition: all 0.55s ease;
+}}
+
+.holo-mini:hover {{
+  transform: scale(1.03);
+  box-shadow: 0 0 22px rgba(0,255,255,0.45);
+}}
+
+.holo-mini:hover::before {{
+  opacity: 1;
+  transform: rotate(-45deg) translateY(110%);
+}}
+
+.holo-mini-title {{
+  font-size: 13px;
+  letter-spacing: 3px;
+  text-transform: uppercase;
+  opacity: 0.85;
+  margin-bottom: 10px;
+}}
+
+.holo-mini-main {{
+  font-size: 32px;
+  font-weight: 900;
+  line-height: 1.1;
+  margin-bottom: 6px;
+}}
+
+.holo-mini-sub {{
+  font-size: 13px;
+  opacity: 0.78;
+}}
+</style>
+</head>
+
+<body>
+
+<div class="holo-wrapper">
+
+  <div class="holo-toggle">
+    <button class="holo-btn" id="toggleBtn">Split Card</button>
+  </div>
+
+  <!-- BIG CARD -->
+  <div class="holo-card" id="bigCard">
+    <div class="holo-date holo-text" id="bigDate">DATE</div>
+    <div class="holo-time holo-text" id="bigClock">00:00:00</div>
+
+    <hr class="holo-hr">
+
+    <div class="holo-city holo-text">{city_name}</div>
+    <div class="holo-temp holo-text">{temp_text}</div>
+    <div class="holo-desc holo-text">{desc_text}</div>
+  </div>
+
+  <!-- MINI CARDS -->
+  <div class="holo-split" id="miniRow">
+
+    <div class="holo-mini">
+      <div class="holo-mini-title holo-text">Time & Date</div>
+      <div class="holo-mini-main holo-text" id="miniClock">00:00</div>
+      <div class="holo-mini-sub holo-text" id="miniDate">DATE</div>
+    </div>
+
+    <div class="holo-mini">
+      <div class="holo-mini-title holo-text">Location</div>
+      <div class="holo-mini-main holo-text">{city_name}</div>
+      <div class="holo-mini-sub holo-text">City</div>
+    </div>
+
+    <div class="holo-mini">
+      <div class="holo-mini-title holo-text">Temp & Weather</div>
+      <div class="holo-mini-main holo-text">{temp_text}</div>
+      <div class="holo-mini-sub holo-text">{desc_text}</div>
+    </div>
+
+  </div>
+
+</div>
+
+<script>
+function updateClock() {{
+  const now = new Date();
+  const h = String(now.getHours()).padStart(2, '0');
+  const m = String(now.getMinutes()).padStart(2, '0');
+  const s = String(now.getSeconds()).padStart(2, '0');
+
+  const options = {{ weekday: 'short', year: 'numeric', month: 'short', day: 'numeric' }};
+  const d = now.toLocaleDateString('en-US', options);
+
+  document.getElementById("bigClock").textContent = h + ":" + m + ":" + s;
+  document.getElementById("bigDate").textContent = d;
+
+  document.getElementById("miniClock").textContent = h + ":" + m;
+  document.getElementById("miniDate").textContent = d;
+}}
+
+setInterval(updateClock, 1000);
+updateClock();
+
+const btn = document.getElementById("toggleBtn");
+const bigCard = document.getElementById("bigCard");
+const miniRow = document.getElementById("miniRow");
+
+let isSplit = false;
+
+btn.addEventListener("click", () => {{
+  isSplit = !isSplit;
+
+  if (isSplit) {{
+    bigCard.style.display = "none";
+    miniRow.classList.add("active");
+    btn.textContent = "Combine Card";
+  }} else {{
+    miniRow.classList.remove("active");
+    bigCard.style.display = "flex";
+    btn.textContent = "Split Card";
+  }}
+}});
+</script>
+
+</body>
+</html>
+"""
+
+components.html(html_holo_card, height=470)
+
+# ==========================================================
+# 11) DEEP LEARNING PREDICTION + MAPPING
+# ==========================================================
+def predict_sentiment_dl(text: str):
+    seq = tokenizer.texts_to_sequences([text])
+
+    # Clip out-of-vocab words
+    vocab_size = model.layers[0].input_dim
+    seq = [[w if w < vocab_size else 1 for w in s] for s in seq]
+
+    pad = pad_sequences(seq, maxlen=MAXLEN, padding="post")
+
+    probs = model.predict(pad, verbose=0)[0]
+    idx = int(np.argmax(probs))
+
+    label = le.inverse_transform([idx])[0]
+    confidence = float(probs[idx]) * 100
+
+    return label.capitalize(), confidence
+
+
+def map_dl_label_to_mood(label: str):
+    if label == "positive":
+        return "Happy"
+    if label == "negative":
+        return "Sad"
+    return "Neutral"
+
+
+# ==========================================================
+# 12) STORY GENERATION (SAME AS YOUR ML UI)
+# ==========================================================
+def story_generation(sentiment, word_limit=150):
+    prompt = (
+        f"Write a unique, suspenseful short story that instantly captures the reader’s attention in the first paragraph "
+        f"with a mysterious or shocking event. The story should revolve around a main character who discovers a hidden truth "
+        f"that turns their reality upside down. Introduce escalating layers of suspense, including red herrings, "
+        f"unexpected betrayals, and moral dilemmas. Structure the plot with rising tension in every scene, "
+        f"ending each major section with a cliffhanger or unanswered question that compels the reader to continue. "
+        f"Set the story in an unusual or eerie setting (e.g., abandoned town, remote island, underground facility). "
+        f"Create emotionally engaging stakes by tying the mystery to the character’s past or relationships. "
+        f"The final twist should reframe everything the reader thought they knew, leaving a lingering question or emotional impact. "
+        f"Do not resolve everything neatly—leave room for interpretation. "
+        f"Keep the story under {word_limit} words, and ensure the tone is influenced by the user's *{sentiment}* feeling."
+    )
+    try:
+        gen_model = genai.GenerativeModel("gemini-2.5-flash")
+        response = gen_model.generate_content(prompt)
+        return response.text
+    except Exception as e:
+        return f"The story is lost in thought... (Error: {e})"
+
+
+# ==========================================================
+# 13) MAIN UI
+# ==========================================================
+st.markdown("<h1 id='dynamicHeading'>AI Mood Adaptive Story</h1>", unsafe_allow_html=True)
+
+if not st.session_state.username:
+    st.session_state.username = st.text_input("First, what's your name?", key="name_input")
+    if st.session_state.username:
+        st.rerun()
+
+else:
+    st.markdown(
+        f"<div id='greetingMessage'>Hello {st.session_state.username}, how are you feeling today?</div>",
+        unsafe_allow_html=True,
+    )
+
+    col_type, col_voice = st.columns(2)
+    with col_type:
+        if st.button("⌨️ Type Input", use_container_width=True):
+            st.session_state.input_mode = "Type"
+    with col_voice:
+        if st.button("🎙️ Voice Input", use_container_width=True):
+            st.session_state.input_mode = "Voice"
+
+    st.markdown("---")
+
+    if st.session_state.input_mode == "Type":
+        st.session_state.typed_text = st.text_area(
+            "Type something about your mood...",
+            placeholder=f"How are you feeling today, {st.session_state.username}?",
+            height=100,
+        )
+
+    elif st.session_state.input_mode == "Voice":
+        st.write("Click the microphone to start talking:")
+
+        audio = mic_recorder(
+            start_prompt="⏺️ Start Recording",
+            stop_prompt="⏹️ Stop",
+            key="recorder",
+        )
+
+        if audio is not None and audio.get("bytes"):
+            with st.spinner("Processing your voice..."):
+                try:
+                    audio_segment = AudioSegment.from_file(io.BytesIO(audio["bytes"]))
+
+                    wav_io = io.BytesIO()
+                    audio_segment.export(wav_io, format="wav")
+                    wav_io.seek(0)
+
+                    r = sr.Recognizer()
+                    with sr.AudioFile(wav_io) as source:
+                        audio_data = r.record(source)
+
+                    st.session_state.voice_text = r.recognize_google(audio_data)
+
+                    st.success("Speech captured successfully!")
+                    st.write("🗣️ **You said:**", st.session_state.voice_text)
+
+                except Exception as e:
+                    st.error(f"Voice processing failed: {e}")
+
+    word_limit = st.slider(
+        "Select Story Length (in words)", min_value=50, max_value=400, value=150, step=10
+    )
+
+    analyze_text = (
+        st.session_state.typed_text.strip()
+        if st.session_state.input_mode == "Type"
+        else st.session_state.voice_text.strip()
+    )
+
+    if st.button("✨ Generate Story ✨"):
+        if analyze_text:
+            with st.spinner("Analyzing with Deep Learning model..."):
+
+                sentiment_label, confidence = predict_sentiment_dl(analyze_text)
+
+                mood = map_dl_label_to_mood(sentiment_label.lower())
+
+                st.session_state.mood = mood
+                st.session_state.story = story_generation(mood, word_limit)
+
+
+                # ✅ Save confidence for UI
+                st.session_state.pred_confidence = confidence
+
+                st.session_state.mood_history.append(
+                f"{sentiment_label} ({confidence:.2f}%): {analyze_text[:30]}..."
+            )
+
+            st.rerun()
+
+    if "pred_confidence" in st.session_state:
+        st.markdown(
+        f"### 🧠 Model Confidence: **{st.session_state.pred_confidence:.2f}%**"
+        )
+
+
+
+
+# ==========================================================
+# 14) STORY OUTPUT
+# ==========================================================
+st.markdown("---")
+st.subheader("Your Adaptive Story")
+st.markdown(f"<div class='story-container'>{st.session_state.story}</div>", unsafe_allow_html=True)
+
+
+# ==========================================================
+# 15) FOOTER
+# ==========================================================
+
+import streamlit as st
+
+footer_html = """
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
+<style>
+    /* Reset some default Streamlit styles that might leak in */
+    .custom-footer a {
+        text-decoration: none !important;
+    }
+
+    .custom-footer {
+        width: 100%;
+        background-color: white;
+        color: #777;
+        font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        padding: 40px 20px 0 20px; /* Added some side padding */
+        margin-top: 50px;
+    }
+    .footer-top {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        padding-bottom: 30px;
+        flex-wrap: wrap;
+        gap: 20px;
+    }
+    
+    /* Email Input Styling */
+    .footer-subscribe {
+        display: flex;
+        align-items: center;
+        background-color: #f0f0f0;
+        border-radius: 4px;
+        padding: 5px 15px;
+        width: 250px;
+        transition: all 0.3s ease; /* Smooth transition */
+    }
+    .footer-subscribe:hover {
+        box-shadow: 0 4px 12px rgba(0,0,0,0.08); /* Soft shadow on hover */
+        background-color: #e8e8e8;
+    }
+    .footer-subscribe input {
+        border: none;
+        background: transparent;
+        outline: none;
+        padding: 10px 0;
+        width: 100%;
+        color: #333;
+    }
+    .footer-subscribe button {
+        border: none;
+        background: transparent;
+        cursor: pointer;
+        color: #333;
+    }
+    .footer-subscribe button i {
+        transition: transform 0.3s ease, color 0.3s ease;
+    }
+    /* Make the arrow slide right and turn blue on hover */
+    .footer-subscribe:hover button i {
+        transform: translateX(4px);
+        color: #2b50ff; 
+    }
+
+    /* Top Navigation Styling */
+    .footer-nav a {
+        color: #777;
+        margin: 0 15px;
+        font-weight: 500;
+        font-size: 15px;
+        transition: color 0.3s ease;
+    }
+    .footer-nav a:hover {
+        color: #2b50ff; /* Shift to brand blue */
+    }
+    
+    /* Social Icons Styling */
+    .footer-socials a {
+        display: inline-flex;
+        justify-content: center;
+        align-items: center;
+        width: 35px;
+        height: 35px;
+        background-color: #f0f0f0;
+        border-radius: 50%;
+        color: #555;
+        margin-left: 10px;
+        font-size: 14px;
+        transition: all 0.3s ease; /* Smooth transition */
+    }
+    .footer-socials a:hover {
+        background-color: #2b50ff; /* Blue background */
+        color: white; /* White icon */
+        transform: translateY(-3px); /* Lift up effect */
+        box-shadow: 0 5px 15px rgba(43, 80, 255, 0.3); /* Blue glow shadow */
+    }
+
+    /* Bottom Section Styling */
+    .footer-bottom {
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        border-top: 1px solid #eaeaea;
+        padding: 30px 0;
+        font-size: 14px;
+        flex-wrap: wrap;
+        gap: 15px;
+    }
+    .footer-bottom-links a {
+        color: #777;
+        margin-right: 20px;
+        transition: color 0.3s ease;
+    }
+    .footer-bottom-links a:hover {
+        color: #2b50ff;
+    }
+    
+    /* Brand Logo */
+    .footer-brand {
+        color: #2b50ff;
+        font-size: 24px;
+        font-weight: bold;
+        transition: transform 0.3s ease;
+    }
+    .footer-brand:hover {
+        transform: scale(1.05); /* Slight pop/zoom effect */
+    }
+</style>
+
+<div class="custom-footer">
+    <div class="footer-top">
+        <div class="footer-subscribe">
+            <input type="email" placeholder="Enter your email">
+            <button><i class="fas fa-arrow-right"></i></button>
+        </div>
+        <div class="footer-nav">
+            <a href="#">Features</a>
+            <a href="#">Blog</a>
+            <a href="#">Pricing</a>
+            <a href="#">Services</a>
+        </div>
+        <div class="footer-socials">
+            <a href="#"><i class="fab fa-twitter"></i></a>
+            <a href="#"><i class="fab fa-instagram"></i></a>
+            <a href="#"><i class="fab fa-facebook-f"></i></a>
+            <a href="#"><i class="fab fa-pinterest-p"></i></a>
+        </div>
+    </div>
+    <div class="footer-bottom">
+        <div class="footer-bottom-links">
+            <a href="#">Terms</a>
+            <a href="#">About</a>
+            <a href="#">Privacy</a>
+            <a href="#">Contact</a>
+        </div>
+        <a href="#" class="footer-brand">Colorlib</a>
+        <div>
+            &copy; 2019. All Rights Reserved.
+        </div>
+    </div>
+</div>
+"""
+
+# Render the footer
+st.markdown(footer_html, unsafe_allow_html=True)
