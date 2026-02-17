@@ -5,3 +5,8 @@ streamlit
 scikit-learn
 pickle-mixin
 
+
+streamlit-mic-recorder
+SpeechRecognition
+pydub
+requests
