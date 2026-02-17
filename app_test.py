@@ -760,8 +760,6 @@ st.markdown(f"<div class='story-container'>{st.session_state.story}</div>", unsa
 # 15) FOOTER
 # ==========================================================
 
-import streamlit as st
-
 footer_html = """
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css">
 <style>
@@ -925,3 +923,4 @@ footer_html = """
 
 # Render the footer
 st.markdown(footer_html, unsafe_allow_html=True)
+
